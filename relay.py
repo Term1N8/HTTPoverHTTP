@@ -1,330 +1,208 @@
 #!/usr/bin/env python3
 
+import argparse
+import base64
 import json
 import os
 import secrets
-import sqlite3
+import ssl
 import threading
-import time
-
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote, parse_qs
+from queue import Empty, Queue
+from urllib.parse import parse_qs, urlparse
 
 
-HOST = os.getenv("RELAY_HOST", "0.0.0.0")
-PORT = int(os.getenv("RELAY_PORT", "9000"))
-TOKEN = os.getenv("RELAY_TOKEN", "change-me")
-DB = os.getenv("RELAY_DB", "./relay.db")
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-AGENT_POLL_MAX = 25
-CONTROLLER_POLL_MAX = 25
+DEFAULT_HOST = os.getenv("RELAY_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.getenv("RELAY_PORT", "9000"))
 
-# Requeue jobs if an Agent claims one and disappears.
-CLAIM_TIMEOUT = 90
+# Change this through RELAY_TOKEN or --token.
+# Do NOT commit a real token to a public repository.
+DEFAULT_TOKEN = os.getenv("RELAY_TOKEN", "CHANGE_ME")
 
-MAX_BODY = 20 * 1024 * 1024
-
-db_lock = threading.Lock()
-
-DB_CONN = sqlite3.connect(
-    DB,
-    check_same_thread=False
+DEFAULT_REQUEST_TIMEOUT = float(
+    os.getenv("RELAY_REQUEST_TIMEOUT", "60")
 )
 
-DB_CONN.execute("""
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    session TEXT NOT NULL,
-    request_b64 TEXT NOT NULL,
-    response_b64 TEXT,
-    status TEXT NOT NULL,
-    created REAL NOT NULL,
-    claimed REAL,
-    completed REAL,
-    error TEXT
+DEFAULT_POLL_WAIT = int(
+    os.getenv("RELAY_POLL_WAIT", "25")
 )
-""")
 
-DB_CONN.commit()
-
-
-def recover_stale_jobs():
-    cutoff = time.time() - CLAIM_TIMEOUT
-
-    with db_lock:
-        DB_CONN.execute(
-            """
-            UPDATE jobs
-            SET
-                status = 'pending',
-                claimed = NULL
-            WHERE
-                status = 'claimed'
-                AND claimed < ?
-            """,
-            (cutoff,)
-        )
-
-        DB_CONN.commit()
+MAX_POLL_WAIT = int(
+    os.getenv("RELAY_MAX_POLL_WAIT", "30")
+)
 
 
-def authenticated(handler):
-    return (
-        handler.headers.get("Authorization", "")
-        == "Bearer " + TOKEN
-    )
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+class SessionState:
+    def __init__(self):
+        self.queue = Queue()
+        self.responses = {}
+        self.response_events = {}
+        self.lock = threading.Lock()
+
+
+SESSIONS = {}
+SESSIONS_LOCK = threading.Lock()
+
+
+def get_session(name):
+    with SESSIONS_LOCK:
+        if name not in SESSIONS:
+            SESSIONS[name] = SessionState()
+
+        return SESSIONS[name]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def json_bytes(obj):
+    return json.dumps(obj).encode("utf-8")
+
+
+def make_request_id():
+    return secrets.token_urlsafe(16)
 
 
 def read_json(handler):
-    length = int(
-        handler.headers.get(
-            "Content-Length",
-            "0"
-        )
-    )
+    raw_length = handler.headers.get("Content-Length")
 
-    if length > MAX_BODY:
-        raise ValueError("request body too large")
+    if raw_length is None:
+        raise ValueError("Missing Content-Length")
 
-    return json.loads(
-        handler.rfile.read(length)
-    )
+    try:
+        length = int(raw_length)
+    except ValueError:
+        raise ValueError("Invalid Content-Length")
+
+    if length <= 0:
+        raise ValueError("Missing request body")
+
+    data = handler.rfile.read(length)
+
+    if not data:
+        raise ValueError("Empty request body")
+
+    return json.loads(data.decode("utf-8"))
 
 
-def send_json(handler, code, obj):
-    data = json.dumps(obj).encode()
-
-    handler.send_response(code)
-
-    handler.send_header(
-        "Content-Type",
-        "application/json"
-    )
-
-    handler.send_header(
-        "Content-Length",
-        str(len(data))
-    )
-
-    handler.end_headers()
-
-    handler.wfile.write(data)
-
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
 
-    protocol_version = "HTTP/1.1"
+    server_version = "BurpRemoteRelay/1.0"
 
     def log_message(self, fmt, *args):
         print(
-            "[HTTP] " + (fmt % args),
+            f"[HTTP] {self.address_string()} "
+            f'"{self.command} {self.path}" '
+            f"{fmt % args}",
             flush=True
         )
 
-    def do_POST(self):
+    def send_json(self, status, obj):
 
-        if not authenticated(self):
-            send_json(
-                self,
-                401,
-                {"error": "unauthorized"}
-            )
-            return
+        data = json_bytes(obj)
 
-        parts = [
-            unquote(x)
-            for x in urlparse(self.path).path.split("/")
-            if x
-        ]
+        self.send_response(status)
 
-        # ------------------------------------------------------
-        # Controller -> Relay
-        #
-        # POST /api/session/<session>/request
-        # ------------------------------------------------------
+        self.send_header(
+            "Content-Type",
+            "application/json"
+        )
 
-        if (
-            len(parts) == 4
-            and parts[0] == "api"
-            and parts[1] == "session"
-            and parts[3] == "request"
-        ):
+        self.send_header(
+            "Content-Length",
+            str(len(data))
+        )
 
-            session = parts[2]
+        self.end_headers()
 
-            try:
-                obj = read_json(self)
-            except Exception as e:
-                send_json(
-                    self,
-                    400,
-                    {"error": str(e)}
-                )
-                return
+        self.wfile.write(data)
 
-            request_b64 = obj.get("request")
+    def send_empty(self, status=204):
 
-            if not request_b64:
-                send_json(
-                    self,
-                    400,
-                    {"error": "missing request"}
-                )
-                return
+        self.send_response(status)
 
-            job_id = secrets.token_urlsafe(16)
+        self.send_header(
+            "Content-Length",
+            "0"
+        )
 
-            with db_lock:
-                DB_CONN.execute(
-                    """
-                    INSERT INTO jobs
-                    (
-                        id,
-                        session,
-                        request_b64,
-                        status,
-                        created
-                    )
-                    VALUES (?, ?, ?, 'pending', ?)
-                    """,
-                    (
-                        job_id,
-                        session,
-                        request_b64,
-                        time.time()
-                    )
-                )
+        self.end_headers()
 
-                DB_CONN.commit()
+    def unauthorized(self):
 
-            print(
-                f"[+] QUEUED "
-                f"id={job_id} "
-                f"session={session}",
-                flush=True
-            )
+        self.send_response(401)
 
-            # Return immediately.
-            send_json(
-                self,
-                200,
-                {
-                    "id": job_id,
-                    "status": "pending"
-                }
-            )
+        self.send_header(
+            "Content-Type",
+            "text/plain"
+        )
 
-            return
+        self.send_header(
+            "WWW-Authenticate",
+            "Bearer"
+        )
 
-        # ------------------------------------------------------
-        # Agent -> Relay
-        #
-        # POST /api/session/<session>/response/<id>
-        # ------------------------------------------------------
+        self.send_header(
+            "Content-Length",
+            "0"
+        )
 
-        if (
-            len(parts) == 5
-            and parts[0] == "api"
-            and parts[1] == "session"
-            and parts[3] == "response"
-        ):
+        self.end_headers()
 
-            session = parts[2]
-            job_id = parts[4]
+    def authenticated(self):
 
-            try:
-                obj = read_json(self)
-            except Exception as e:
-                send_json(
-                    self,
-                    400,
-                    {"error": str(e)}
-                )
-                return
+        token = self.server.relay_token
 
-            response_b64 = obj.get("response")
+        if not token:
+            return True
 
-            if response_b64 is None:
-                send_json(
-                    self,
-                    400,
-                    {"error": "missing response"}
-                )
-                return
+        supplied = self.headers.get(
+            "Authorization",
+            ""
+        )
 
-            with db_lock:
-                cursor = DB_CONN.execute(
-                    """
-                    UPDATE jobs
-                    SET
-                        response_b64 = ?,
-                        status = 'complete',
-                        completed = ?
-                    WHERE
-                        id = ?
-                        AND session = ?
-                    """,
-                    (
-                        response_b64,
-                        time.time(),
-                        job_id,
-                        session
-                    )
-                )
+        expected = "Bearer " + token
 
-                DB_CONN.commit()
+        return secrets.compare_digest(
+            supplied,
+            expected
+        )
 
-            if cursor.rowcount == 0:
-                send_json(
-                    self,
-                    404,
-                    {"error": "job not found"}
-                )
-                return
-
-            print(
-                f"[+] COMPLETE "
-                f"id={job_id} "
-                f"session={session}",
-                flush=True
-            )
-
-            send_json(
-                self,
-                200,
-                {"ok": True}
-            )
-
-            return
-
-        self.send_error(404)
+    # -----------------------------------------------------------------------
+    # GET
+    # -----------------------------------------------------------------------
 
     def do_GET(self):
 
-        if not authenticated(self):
-            send_json(
-                self,
-                401,
-                {"error": "unauthorized"}
+        if not self.authenticated():
+
+            print(
+                "[!] Unauthorized GET:",
+                self.path,
+                flush=True
             )
+
+            self.unauthorized()
             return
 
         parsed = urlparse(self.path)
 
-        parts = [
-            unquote(x)
-            for x in parsed.path.split("/")
-            if x
-        ]
+        parts = parsed.path.strip("/").split("/")
 
-        query = parse_qs(parsed.query)
-
-        # ------------------------------------------------------
-        # Agent long poll
-        #
-        # GET /api/session/<session>/next?wait=25
-        # ------------------------------------------------------
-
+        # /api/session/<session>/next
         if (
             len(parts) == 4
             and parts[0] == "api"
@@ -332,97 +210,80 @@ class Handler(BaseHTTPRequestHandler):
             and parts[3] == "next"
         ):
 
-            session = parts[2]
+            session_name = parts[2]
+
+            query = parse_qs(
+                parsed.query
+            )
 
             try:
+
                 wait = int(
-                    query.get("wait", ["25"])[0]
+                    query.get(
+                        "wait",
+                        [DEFAULT_POLL_WAIT]
+                    )[0]
                 )
+
             except ValueError:
-                wait = 25
 
-            wait = min(
-                max(wait, 1),
-                AGENT_POLL_MAX
+                wait = DEFAULT_POLL_WAIT
+
+            wait = max(
+                1,
+                min(wait, MAX_POLL_WAIT)
             )
 
-            deadline = time.time() + wait
-
-            while time.time() < deadline:
-
-                recover_stale_jobs()
-
-                with db_lock:
-                    row = DB_CONN.execute(
-                        """
-                        SELECT
-                            id,
-                            request_b64
-                        FROM jobs
-                        WHERE
-                            session = ?
-                            AND status = 'pending'
-                        ORDER BY created
-                        LIMIT 1
-                        """,
-                        (session,)
-                    ).fetchone()
-
-                    if row:
-
-                        DB_CONN.execute(
-                            """
-                            UPDATE jobs
-                            SET
-                                status = 'claimed',
-                                claimed = ?
-                            WHERE
-                                id = ?
-                                AND status = 'pending'
-                            """,
-                            (
-                                time.time(),
-                                row[0]
-                            )
-                        )
-
-                        DB_CONN.commit()
-
-                        print(
-                            f"[>] DISPATCH "
-                            f"id={row[0]} "
-                            f"session={session}",
-                            flush=True
-                        )
-
-                        send_json(
-                            self,
-                            200,
-                            {
-                                "id": row[0],
-                                "request": row[1]
-                            }
-                        )
-
-                        return
-
-                time.sleep(0.1)
-
-            self.send_response(204)
-            self.send_header(
-                "Content-Length",
-                "0"
+            self.handle_next(
+                session_name,
+                wait
             )
-            self.end_headers()
 
             return
 
-        # ------------------------------------------------------
-        # Controller waits for result
-        #
-        # GET /api/session/<session>/response/<id>?wait=25
-        # ------------------------------------------------------
+        self.send_json(
+            404,
+            {
+                "error": "not found"
+            }
+        )
 
+    # -----------------------------------------------------------------------
+    # POST
+    # -----------------------------------------------------------------------
+
+    def do_POST(self):
+
+        if not self.authenticated():
+
+            print(
+                "[!] Unauthorized POST:",
+                self.path,
+                flush=True
+            )
+
+            self.unauthorized()
+            return
+
+        parsed = urlparse(self.path)
+
+        parts = parsed.path.strip("/").split("/")
+
+        # /api/session/<session>/request
+        if (
+            len(parts) == 4
+            and parts[0] == "api"
+            and parts[1] == "session"
+            and parts[3] == "request"
+        ):
+
+            self.handle_request(
+                parts[2]
+            )
+
+            return
+
+        # /api/session/<session>/response/<request-id>
         if (
             len(parts) == 5
             and parts[0] == "api"
@@ -430,149 +291,421 @@ class Handler(BaseHTTPRequestHandler):
             and parts[3] == "response"
         ):
 
-            session = parts[2]
-            job_id = parts[4]
+            self.handle_response(
+                parts[2],
+                parts[4]
+            )
 
-            try:
-                wait = int(
-                    query.get("wait", ["25"])[0]
+            return
+
+        self.send_json(
+            404,
+            {
+                "error": "not found"
+            }
+        )
+
+    # -----------------------------------------------------------------------
+    # Controller -> Relay
+    # -----------------------------------------------------------------------
+
+    def handle_request(self, session_name):
+
+        try:
+
+            body = read_json(self)
+
+            encoded_request = body.get(
+                "request"
+            )
+
+            if not encoded_request:
+                raise ValueError(
+                    "Missing request"
                 )
-            except ValueError:
-                wait = 25
 
-            wait = min(
-                max(wait, 1),
-                CONTROLLER_POLL_MAX
+            # Validate Base64.
+            base64.b64decode(
+                encoded_request,
+                validate=True
             )
 
-            deadline = time.time() + wait
+        except Exception as exc:
 
-            while time.time() < deadline:
+            print(
+                f"[-] Invalid request: {exc}",
+                flush=True
+            )
 
-                with db_lock:
-                    row = DB_CONN.execute(
-                        """
-                        SELECT
-                            status,
-                            response_b64,
-                            error
-                        FROM jobs
-                        WHERE
-                            id = ?
-                            AND session = ?
-                        """,
-                        (
-                            job_id,
-                            session
-                        )
-                    ).fetchone()
-
-                if row is None:
-                    send_json(
-                        self,
-                        404,
-                        {"error": "job not found"}
-                    )
-                    return
-
-                status, response, error = row
-
-                if status == "complete":
-                    send_json(
-                        self,
-                        200,
-                        {
-                            "id": job_id,
-                            "status": "complete",
-                            "response": response
-                        }
-                    )
-                    return
-
-                if status == "failed":
-                    send_json(
-                        self,
-                        200,
-                        {
-                            "id": job_id,
-                            "status": "failed",
-                            "error": error
-                        }
-                    )
-                    return
-
-                time.sleep(0.1)
-
-            send_json(
-                self,
-                202,
+            self.send_json(
+                400,
                 {
-                    "id": job_id,
-                    "status": "pending"
+                    "error": str(exc)
                 }
             )
 
             return
 
-        # ------------------------------------------------------
-        # Session status
-        # ------------------------------------------------------
+        session = get_session(
+            session_name
+        )
 
-        if (
-            len(parts) == 3
-            and parts[0] == "api"
-            and parts[1] == "session"
-        ):
+        request_id = make_request_id()
 
-            session = parts[2]
+        event = threading.Event()
 
-            with db_lock:
-                rows = DB_CONN.execute(
-                    """
-                    SELECT
-                        status,
-                        COUNT(*)
-                    FROM jobs
-                    WHERE session = ?
-                    GROUP BY status
-                    """,
-                    (session,)
-                ).fetchall()
+        with session.lock:
 
-            send_json(
-                self,
-                200,
+            session.response_events[
+                request_id
+            ] = event
+
+        session.queue.put(
+            {
+                "id": request_id,
+                "request": encoded_request
+            }
+        )
+
+        print(
+            f"[+] Queued {request_id} "
+            f"session={session_name}",
+            flush=True
+        )
+
+        print(
+            f"[>] Waiting for agent "
+            f"response {request_id}",
+            flush=True
+        )
+
+        completed = event.wait(
+            timeout=self.server.request_timeout
+        )
+
+        with session.lock:
+
+            response = session.responses.pop(
+                request_id,
+                None
+            )
+
+            session.response_events.pop(
+                request_id,
+                None
+            )
+
+        if not completed or response is None:
+
+            print(
+                f"[-] Agent timeout "
+                f"{request_id}",
+                flush=True
+            )
+
+            self.send_json(
+                504,
                 {
-                    "session": session,
-                    "jobs": dict(rows)
+                    "error": "agent timeout",
+                    "requestId": request_id
                 }
             )
 
             return
 
-        self.send_error(404)
+        print(
+            f"[+] Agent response received "
+            f"{request_id}",
+            flush=True
+        )
+
+        self.send_json(
+            200,
+            response
+        )
+
+    # -----------------------------------------------------------------------
+    # Relay -> Agent
+    # -----------------------------------------------------------------------
+
+    def handle_next(
+        self,
+        session_name,
+        wait
+    ):
+
+        session = get_session(
+            session_name
+        )
+
+        try:
+
+            job = session.queue.get(
+                timeout=wait
+            )
+
+        except Empty:
+
+            self.send_empty(204)
+
+            return
+
+        print(
+            f"[>] Dispatching "
+            f"{job['id']} "
+            f"to agent "
+            f"session={session_name}",
+            flush=True
+        )
+
+        self.send_json(
+            200,
+            job
+        )
+
+    # -----------------------------------------------------------------------
+    # Agent -> Relay
+    # -----------------------------------------------------------------------
+
+    def handle_response(
+        self,
+        session_name,
+        request_id
+    ):
+
+        session = get_session(
+            session_name
+        )
+
+        try:
+
+            body = read_json(self)
+
+        except Exception as exc:
+
+            self.send_json(
+                400,
+                {
+                    "error": str(exc)
+                }
+            )
+
+            return
+
+        with session.lock:
+
+            event = session.response_events.get(
+                request_id
+            )
+
+            if event is None:
+
+                print(
+                    f"[-] Unknown request "
+                    f"{request_id}",
+                    flush=True
+                )
+
+                self.send_json(
+                    404,
+                    {
+                        "error": "unknown request",
+                        "requestId": request_id
+                    }
+                )
+
+                return
+
+            session.responses[
+                request_id
+            ] = body
+
+            event.set()
+
+        print(
+            f"[<] Response from agent "
+            f"{request_id} "
+            f"session={session_name}",
+            flush=True
+        )
+
+        self.send_json(
+            200,
+            {
+                "ok": True
+            }
+        )
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    print()
-    print("[*] Burp Remote Relay")
-    print(f"[*] Listening on {HOST}:{PORT}")
-    print(f"[*] Database: {DB}")
-    print()
+def main():
 
-    if TOKEN == "change-me":
-        print("[!] WARNING: default token")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Burp Remote Agent HTTP/HTTPS relay"
+        )
+    )
+
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help="Bind address"
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="Listen port"
+    )
+
+    parser.add_argument(
+        "--token",
+        default=DEFAULT_TOKEN,
+        help="Bearer authentication token"
+    )
+
+    parser.add_argument(
+        "--cert",
+        help="TLS certificate PEM"
+    )
+
+    parser.add_argument(
+        "--key",
+        help="TLS private key PEM"
+    )
+
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help="Controller request timeout in seconds"
+    )
+
+    args = parser.parse_args()
+
+    if bool(args.cert) != bool(args.key):
+
+        parser.error(
+            "--cert and --key must be supplied together"
+        )
+
+    if args.token == "CHANGE_ME":
+
+        print(
+            "[!] WARNING: using default token "
+            "CHANGE_ME",
+            flush=True
+        )
+
+        print(
+            "[!] Set RELAY_TOKEN or use --token "
+            "before exposing the relay.",
+            flush=True
+        )
 
     server = ThreadingHTTPServer(
-        (HOST, PORT),
+        (
+            args.host,
+            args.port
+        ),
         Handler
     )
 
+    # Make configuration available to each request handler.
+    server.relay_token = args.token
+    server.request_timeout = args.request_timeout
+
+    protocol = "HTTP"
+
+    # -----------------------------------------------------------------------
+    # TLS
+    # -----------------------------------------------------------------------
+
+    if args.cert and args.key:
+
+        context = ssl.SSLContext(
+            ssl.PROTOCOL_TLS_SERVER
+        )
+
+        context.minimum_version = (
+            ssl.TLSVersion.TLSv1_2
+        )
+
+        context.load_cert_chain(
+            certfile=args.cert,
+            keyfile=args.key
+        )
+
+        server.socket = context.wrap_socket(
+            server.socket,
+            server_side=True
+        )
+
+        protocol = "HTTPS"
+
+    # -----------------------------------------------------------------------
+    # Startup
+    # -----------------------------------------------------------------------
+
+    print()
+    print(
+        "[+] Burp Remote Agent Relay"
+    )
+
+    print(
+        f"[+] Listen: {args.host}:{args.port}"
+    )
+
+    print(
+        f"[+] Protocol: {protocol}"
+    )
+
+    print(
+        "[+] Bearer authentication: "
+        + (
+            "enabled"
+            if args.token
+            else "DISABLED"
+        )
+    )
+
+    if args.cert:
+
+        print(
+            f"[+] TLS certificate: "
+            f"{args.cert}"
+        )
+
+    print(
+        f"[+] Request timeout: "
+        f"{args.request_timeout}s"
+    )
+
+    print()
+    print(
+        "[*] Waiting for connections..."
+    )
+    print()
+
     try:
+
         server.serve_forever()
+
     except KeyboardInterrupt:
-        print("\n[*] Shutting down")
+
+        print(
+            "\n[*] Shutting down..."
+        )
+
     finally:
+
+        server.shutdown()
         server.server_close()
-        DB_CONN.close()
+
+
+if __name__ == "__main__":
+    main()
